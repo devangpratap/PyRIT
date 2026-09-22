@@ -316,23 +316,28 @@ class AttackPrompt:
         encoding = self.tokenizer(prompt)
         toks = encoding.input_ids
 
-        # Locate goal/control/target substrings in the rendered prompt. The goal and control are
-        # rendered as one contiguous user turn, so search for that whole string, derive the control
-        # offset from it, and look for the target only after that turn. Searching for each piece
-        # independently takes the first occurrence anywhere in the prompt, so a goal that quotes its
-        # own target (common with affirmative-prefix targets) or that contains the control string
-        # silently produced slices pointing back into the user turn.
-        user_content = f"{self.goal} {self.control}"
-        user_start = prompt.find(user_content)
-        target_start = prompt.find(self.target, user_start + len(user_content)) if user_start != -1 else -1
-        if user_start == -1 or target_start == -1:
+        # Locate goal/control/target substrings in the rendered prompt. Searching for each piece
+        # independently from the start takes the first occurrence anywhere, so a goal that quotes
+        # its own target (common with affirmative-prefix targets), or a target that also names the
+        # assistant role marker, silently produced slices pointing at the wrong turn. Instead, find
+        # where the assistant content starts: rendering only the user turn with a generation
+        # prompt gives exactly the text before it, provided the full prompt extends that render.
+        # The control is then the last occurrence before that boundary (it ends the user content),
+        # the goal the last one before the control, and the target the first one after it.
+        user_prompt = self.tokenizer.apply_chat_template(messages[:1], tokenize=False, add_generation_prompt=True)
+        verified = isinstance(user_prompt, str) and len(user_prompt) < len(prompt) and prompt.startswith(user_prompt)
+        user_end = len(user_prompt) if verified else len(prompt)
+        control_start = prompt.rfind(self.control, 0, user_end)
+        goal_start = prompt.rfind(self.goal, 0, control_start) if control_start != -1 else -1
+        # Without a verified boundary, fall back to the end of the control.
+        assistant_start = user_end if verified else control_start + len(self.control)
+        target_start = prompt.find(self.target, assistant_start) if goal_start != -1 else -1
+        if target_start == -1:
             raise ValueError(
                 "Could not locate goal/control/target in chat-templated prompt. "
                 f"prompt={prompt!r}, goal={self.goal!r}, "
                 f"control={self.control!r}, target={self.target!r}"
             )
-        goal_start = user_start
-        control_start = user_start + len(self.goal) + 1
 
         # ``char_to_token`` returns None when the character index has no
         # corresponding token (e.g. when the substring ends exactly at the end

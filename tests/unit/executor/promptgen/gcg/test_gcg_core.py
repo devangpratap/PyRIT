@@ -506,6 +506,31 @@ def _offset_tokenizer(prompt_text: str) -> Any:
     return tokenizer
 
 
+def _fast_tokenizer(chat_template: str) -> Any:
+    """
+    Build a real fast tokenizer offline that registers the chat role markers as special tokens.
+
+    Words map to ``[UNK]``, which is enough here: only the character offsets matter for slicing.
+
+    Args:
+        chat_template (str): The Jinja chat template to render with.
+
+    Returns:
+        Any: A ``PreTrainedTokenizerFast`` with ``chat_template`` set.
+    """
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+    tokenizer.add_special_tokens(
+        {"additional_special_tokens": ["<|user|>", "<|assistant|>", "<|end|>", "<start_of_turn>", "<end_of_turn>"]}
+    )
+    tokenizer.chat_template = chat_template
+    return tokenizer
+
+
 class TestUpdateIdsErrorPaths:
     """Tests covering the error / fallback paths in AttackPrompt._update_ids."""
 
@@ -658,6 +683,46 @@ class TestUpdateIdsErrorPaths:
 
         assert prompt._target_slice.start >= prompt._control_slice.stop
         assert prompt._assistant_role_slice.start <= prompt._assistant_role_slice.stop
+
+    def test_target_that_names_the_assistant_role_marker_is_found_in_the_reply(self) -> None:
+        """A target like "assistant" also matches inside ``<|assistant|>``, which is one special token.
+
+        Searching right after the user content lands on the role marker and leaves an empty target
+        slice, so the search has to start where the assistant content does.
+        """
+        tokenizer = _fast_tokenizer(
+            "{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}<|end|>{% endfor %}"
+            "{% if add_generation_prompt %}<|assistant|>{% endif %}"
+        )
+
+        prompt = AttackPrompt(goal="Say it", target="assistant", tokenizer=tokenizer, control_init="! !")
+
+        ids = tokenizer("<|user|>Say it ! !<|end|><|assistant|>assistant<|end|>").input_ids
+        # <|user|> Say it ! ! <|end|> <|assistant|> assistant <|end|>
+        assert prompt._control_slice == slice(3, 5)
+        assert prompt._target_slice == slice(7, 8)
+        assert prompt._loss_slice == slice(6, 7)
+        assert ids[6] == tokenizer.convert_tokens_to_ids("<|assistant|>")
+
+    def test_empty_goal_with_a_trimming_template(self) -> None:
+        """Target-only datasets use an empty goal, so the user content is " <control>".
+
+        A template that trims the content drops that leading space, so the control has to be found on
+        its own rather than as part of the raw ``f"{goal} {control}"`` string.
+        """
+        tokenizer = _fast_tokenizer(
+            "{% for m in messages %}<start_of_turn>{{ 'model' if m['role'] == 'assistant' else m['role'] }}\n"
+            "{{ m['content'] | trim }}<end_of_turn>\n{% endfor %}"
+            "{% if add_generation_prompt %}<start_of_turn>model\n{% endif %}"
+        )
+
+        prompt = AttackPrompt(goal="", target="Sure, here", tokenizer=tokenizer, control_init="! ! !")
+
+        # <start_of_turn> user ! ! ! <end_of_turn> <start_of_turn> model Sure , here <end_of_turn>
+        assert prompt._goal_slice == slice(2, 2)
+        assert prompt._control_slice == slice(2, 5)
+        assert prompt._target_slice == slice(8, 11)
+        assert prompt._loss_slice == slice(7, 10)
 
 
 class TestGetWorkersChatTemplateValidation:
