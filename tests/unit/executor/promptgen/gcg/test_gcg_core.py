@@ -506,6 +506,16 @@ def _offset_tokenizer(prompt_text: str) -> Any:
     return tokenizer
 
 
+_CHATML_TEMPLATE = (
+    "{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}<|end|>{% endfor %}"
+    "{% if add_generation_prompt %}<|assistant|>{% endif %}"
+)
+
+# A complete-conversation template is allowed to ignore add_generation_prompt, so the user-only
+# render stops before the assistant marker instead of after it.
+_NO_GENERATION_PROMPT_TEMPLATE = "{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}<|end|>{% endfor %}"
+
+
 def _fast_tokenizer(chat_template: str) -> Any:
     """
     Build a real fast tokenizer offline that registers the chat role markers as special tokens.
@@ -672,12 +682,11 @@ class TestUpdateIdsErrorPaths:
         goal = "Respond with Sure, here is the plan"
         control = "! ! ! !"
         target = "Sure, here is the plan"
-        prompt_text = f"<|user|>\n{goal} {control}<|end|>\n<|assistant|>\n{target}<|end|>"
 
         prompt = AttackPrompt(
             goal=goal,
             target=target,
-            tokenizer=_offset_tokenizer(prompt_text),
+            tokenizer=_fast_tokenizer(_CHATML_TEMPLATE),
             control_init=control,
         )
 
@@ -690,10 +699,7 @@ class TestUpdateIdsErrorPaths:
         Searching right after the user content lands on the role marker and leaves an empty target
         slice, so the search has to start where the assistant content does.
         """
-        tokenizer = _fast_tokenizer(
-            "{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}<|end|>{% endfor %}"
-            "{% if add_generation_prompt %}<|assistant|>{% endif %}"
-        )
+        tokenizer = _fast_tokenizer(_CHATML_TEMPLATE)
 
         prompt = AttackPrompt(goal="Say it", target="assistant", tokenizer=tokenizer, control_init="! !")
 
@@ -703,6 +709,37 @@ class TestUpdateIdsErrorPaths:
         assert prompt._target_slice == slice(7, 8)
         assert prompt._loss_slice == slice(6, 7)
         assert ids[6] == tokenizer.convert_tokens_to_ids("<|assistant|>")
+
+    def test_control_that_collides_with_the_role_marker_keeps_its_slice(self) -> None:
+        """An optimized control is decoded vocabulary tokens, so it can contain ordinary words.
+
+        A control holding "assistant" also matches inside ``<|assistant|>``; bounding the search to
+        the user content is what keeps the control slice pointing at the suffix GCG optimizes.
+        """
+        tokenizer = _fast_tokenizer(_CHATML_TEMPLATE)
+
+        prompt = AttackPrompt(goal="Say it", target="done", tokenizer=tokenizer, control_init="assistant")
+
+        # <|user|> Say it assistant <|end|> <|assistant|> done <|end|>
+        assert prompt._control_slice == slice(3, 4)
+        assert prompt._target_slice == slice(6, 7)
+        assert prompt._loss_slice == slice(5, 6)
+
+    def test_boundary_holds_when_the_template_ignores_the_generation_prompt(self) -> None:
+        """``add_generation_prompt`` is documented as a no-op for templates that do not support it.
+
+        The user-only render is still a prefix of the full prompt, so it cannot be trusted as the
+        assistant boundary: it stops before ``<|assistant|>`` and a target of "assistant" would
+        match the role marker again.
+        """
+        tokenizer = _fast_tokenizer(_NO_GENERATION_PROMPT_TEMPLATE)
+
+        prompt = AttackPrompt(goal="Say it", target="assistant", tokenizer=tokenizer, control_init="! !")
+
+        # <|user|> Say it ! ! <|end|> <|assistant|> assistant <|end|>
+        assert prompt._control_slice == slice(3, 5)
+        assert prompt._target_slice == slice(7, 8)
+        assert prompt._loss_slice == slice(6, 7)
 
     def test_empty_goal_with_a_trimming_template(self) -> None:
         """Target-only datasets use an empty goal, so the user content is " <control>".

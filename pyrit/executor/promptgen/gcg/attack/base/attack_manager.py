@@ -303,6 +303,52 @@ class AttackPrompt:
 
         self._update_ids()
 
+    def _content_bounds(self, prompt: str) -> tuple[int, int, int]:
+        """
+        Locate where the user content and the assistant content sit in the rendered prompt.
+
+        Rendering the same two messages with sentinel contents shows the template's own
+        scaffolding: everything before the user content, and everything between the two contents.
+        Measuring it this way keeps the role markers out of the search ranges, so a goal, control
+        or target that happens to contain role text (``assistant`` is an ordinary word, and an
+        optimized control is decoded vocabulary tokens) cannot match the scaffolding instead of
+        the turn. Templates that ignore ``add_generation_prompt`` are handled too, since nothing
+        here assumes the generation prompt renders the assistant preamble.
+
+        Args:
+            prompt (str): The rendered prompt for the current goal, control and target.
+
+        Returns:
+            tuple[int, int, int]: Start of the user content, its end, and the assistant content
+            start. Falls back to the whole prompt for a template whose scaffolding cannot be
+            measured, which leaves the searches no worse off than an unbounded scan.
+        """
+        user_sentinel, assistant_sentinel = "\x00pyrit-user\x00", "\x00pyrit-assistant\x00"
+        try:
+            scaffold = self.tokenizer.apply_chat_template(
+                [
+                    {"role": "user", "content": user_sentinel},
+                    {"role": "assistant", "content": assistant_sentinel},
+                ],
+                tokenize=False,
+            )
+            user_at = scaffold.index(user_sentinel)
+            assistant_at = scaffold.index(assistant_sentinel, user_at)
+        except Exception:  # pylint: disable=broad-except
+            return 0, len(prompt), 0
+
+        prefix = scaffold[:user_at]
+        # The text the template puts between the user content and the assistant content.
+        separator = scaffold[user_at + len(user_sentinel) : assistant_at]
+        if not separator or not prompt.startswith(prefix):
+            return 0, len(prompt), 0
+
+        user_start = len(prefix)
+        separator_at = prompt.find(separator, user_start)
+        if separator_at == -1:
+            return user_start, len(prompt), user_start
+        return user_start, separator_at, separator_at + len(separator)
+
     def _update_ids(self) -> None:
         # Render the goal+control as the user turn and the target as the assistant turn using the
         # tokenizer's built-in chat template. This replaces fastchat's per-model Conversation logic
@@ -318,19 +364,14 @@ class AttackPrompt:
 
         # Locate goal/control/target substrings in the rendered prompt. Searching for each piece
         # independently from the start takes the first occurrence anywhere, so a goal that quotes
-        # its own target (common with affirmative-prefix targets), or a target that also names the
-        # assistant role marker, silently produced slices pointing at the wrong turn. Instead, find
-        # where the assistant content starts: rendering only the user turn with a generation
-        # prompt gives exactly the text before it, provided the full prompt extends that render.
-        # The control is then the last occurrence before that boundary (it ends the user content),
-        # the goal the last one before the control, and the target the first one after it.
-        user_prompt = self.tokenizer.apply_chat_template(messages[:1], tokenize=False, add_generation_prompt=True)
-        verified = isinstance(user_prompt, str) and len(user_prompt) < len(prompt) and prompt.startswith(user_prompt)
-        user_end = len(user_prompt) if verified else len(prompt)
-        control_start = prompt.rfind(self.control, 0, user_end)
-        goal_start = prompt.rfind(self.goal, 0, control_start) if control_start != -1 else -1
-        # Without a verified boundary, fall back to the end of the control.
-        assistant_start = user_end if verified else control_start + len(self.control)
+        # its own target (common with affirmative-prefix targets), or a piece that contains role
+        # text, silently produced slices pointing at the scaffolding or the wrong turn. Search
+        # within the measured content ranges instead: the control is the last occurrence in the
+        # user content (it ends that turn), the goal the last one before the control, and the
+        # target the first one in the assistant content.
+        user_start, user_end, assistant_start = self._content_bounds(prompt)
+        control_start = prompt.rfind(self.control, user_start, user_end)
+        goal_start = prompt.rfind(self.goal, user_start, control_start) if control_start != -1 else -1
         target_start = prompt.find(self.target, assistant_start) if goal_start != -1 else -1
         if target_start == -1:
             raise ValueError(
