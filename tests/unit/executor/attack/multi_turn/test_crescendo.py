@@ -2610,8 +2610,10 @@ class TestEdgeCases:
 
         context = CrescendoAttackContext(params=AttackParameters(objective=""))
 
-        with pytest.raises(ValueError, match="Strategy context validation failed for CrescendoAttack"):
+        with pytest.raises(ValueError, match="MatchesObjective requires the expectation to carry an objective"):
             await attack.execute_with_context_async(context=context)
+        mock_objective_target.send_prompt_async.assert_not_awaited()
+        mock_adversarial_chat.send_prompt_async.assert_not_awaited()
 
     async def test_attack_with_json_parsing_retry(
         self,
@@ -3061,6 +3063,7 @@ class TestModalityRouterIntegration:
         assert sent_message.message_pieces[0].converted_value_data_type == "text"
 
 
+@pytest.mark.usefixtures("patch_central_database")
 class TestCrescendoAdversarialIdentity:
     """Tests for adversarial config in the Crescendo attack identity and inline system prompt."""
 

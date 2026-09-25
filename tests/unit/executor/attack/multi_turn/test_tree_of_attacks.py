@@ -41,6 +41,7 @@ from pyrit.models import (
     MessagePiece,
     Score,
     ScoreStatus,
+    ScoringExpectation,
     SeedPrompt,
 )
 from pyrit.prompt_normalizer import PromptNormalizer
@@ -1197,6 +1198,7 @@ class TestBlockedScoringDefaults:
                 objective_target=builder.objective_target,
             ),
             record_objective_conversation=lambda *, conversation_id: None,
+            expectation=ScoringExpectation(objective="test objective"),
             desired_response_prefix="Sure, here is",
             prompt_normalizer=normalizer,
         )
@@ -1264,6 +1266,7 @@ class TestBlockedScoringDefaults:
                 objective_target=builder.objective_target,
             ),
             record_objective_conversation=lambda *, conversation_id: None,
+            expectation=ScoringExpectation(objective="test objective"),
             desired_response_prefix="Sure, here is",
             prompt_normalizer=normalizer,
         )
@@ -1692,6 +1695,7 @@ class TestTreeOfAttacksNode:
             "attack_strategy_name": "TreeOfAttacksWithPruningAttack",
             "modality_router": modality_router,
             "record_objective_conversation": lambda *, conversation_id: None,
+            "expectation": ScoringExpectation(objective="test objective"),
             "memory_labels": {"test": "label"},
             "parent_id": None,
             "prompt_normalizer": prompt_normalizer,
@@ -2774,6 +2778,7 @@ class TestTreeOfAttacksConversationTracking:
         )
 
 
+@pytest.mark.usefixtures("patch_central_database")
 def test_tap_init_raises_when_objective_scorer_is_none():
     """Test that TAP __init__ raises ValueError when AttackScoringConfig has objective_scorer=None."""
     scoring_config = AttackScoringConfig(objective_scorer=None)
@@ -2783,6 +2788,7 @@ def test_tap_init_raises_when_objective_scorer_is_none():
             attack_adversarial_config=MagicMock(
                 target=MagicMock(spec=PromptTarget),
                 system_prompt=None,
+                system_prompt_prefix=None,
             ),
             attack_scoring_config=scoring_config,
         )
@@ -3198,6 +3204,7 @@ class TestModalityRouterIntegration:
             "attack_strategy_name": "TreeOfAttacksWithPruningAttack",
             "modality_router": modality_router,
             "record_objective_conversation": lambda *, conversation_id: None,
+            "expectation": ScoringExpectation(objective="test objective"),
             "memory_labels": {},
             "parent_id": None,
             "prompt_normalizer": prompt_normalizer,
@@ -3444,6 +3451,7 @@ class TestModalityRouterIntegration:
         assert sent.get_value() == "feedback text"
 
 
+@pytest.mark.usefixtures("patch_central_database")
 class TestTAPAdversarialIdentity:
     """Tests for adversarial config in the TAP attack identity and inline system prompt."""
 
