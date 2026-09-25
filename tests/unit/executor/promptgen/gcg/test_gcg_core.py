@@ -484,45 +484,17 @@ class TestEvaluateAttackInit:
             )
 
 
-def _offset_tokenizer(prompt_text: str) -> Any:
-    """Build a mock tokenizer that renders ``prompt_text`` and maps characters to tokens.
-
-    Each whitespace-delimited run of characters becomes one token, and ``char_to_token``
-    reports the token containing a character, which is how a fast tokenizer behaves. This
-    keeps slice assertions meaningful without downloading a real tokenizer.
+def _chat_template(fmt: str) -> Any:
+    """
+    Build an ``apply_chat_template`` stand-in that formats the user and assistant contents into ``fmt``.
 
     Args:
-        prompt_text (str): The already-rendered chat prompt the tokenizer should return.
+        fmt (str): A format string with one ``{}`` for the user content and one for the assistant content.
 
     Returns:
-        Any: A mock tokenizer suitable for constructing an AttackPrompt.
+        Any: A callable usable as ``apply_chat_template.side_effect``.
     """
-    spans: list[tuple[int, int]] = []
-    start: int | None = None
-    for index, char in enumerate(prompt_text):
-        if char.isspace():
-            if start is not None:
-                spans.append((start, index))
-                start = None
-        elif start is None:
-            start = index
-    if start is not None:
-        spans.append((start, len(prompt_text)))
-
-    def char_to_token(pos: int) -> int | None:
-        for token_index, (begin, end) in enumerate(spans):
-            if begin <= pos < end:
-                return token_index
-        return None
-
-    encoding = MagicMock()
-    encoding.input_ids = list(range(len(spans)))
-    encoding.char_to_token.side_effect = char_to_token
-
-    tokenizer = MagicMock()
-    tokenizer.apply_chat_template.return_value = prompt_text
-    tokenizer.return_value = encoding
-    return tokenizer
+    return lambda messages, **_kwargs: fmt.format(*(m["content"] for m in messages))
 
 
 _CHATML_TEMPLATE = (
@@ -575,7 +547,7 @@ class TestUpdateIdsErrorPaths:
         encoding.char_to_token.return_value = 1
         tokenizer.return_value = encoding
 
-        with pytest.raises(ValueError, match="Could not locate goal/control/target"):
+        with pytest.raises(ValueError, match="Could not locate the user and assistant contents"):
             AttackPrompt(
                 goal="this-goal-is-missing",
                 target="this-target-is-missing",
@@ -607,7 +579,7 @@ class TestUpdateIdsErrorPaths:
         encoding.char_to_token.side_effect = char_to_token
 
         tokenizer = MagicMock()
-        tokenizer.apply_chat_template.return_value = prompt_text
+        tokenizer.apply_chat_template.side_effect = _chat_template("USER {} ASSISTANT {}")
         tokenizer.return_value = encoding
 
         # Construction must succeed even though char_to_token returns None at goal/target
@@ -641,7 +613,7 @@ class TestUpdateIdsErrorPaths:
         encoding.char_to_token.side_effect = char_to_token
 
         tokenizer = MagicMock()
-        tokenizer.apply_chat_template.return_value = prompt_text
+        tokenizer.apply_chat_template.side_effect = _chat_template("USER {} ASSISTANT world {}")
         tokenizer.return_value = encoding
 
         # "tail" as the target — its start position and every position after it returns
@@ -678,7 +650,7 @@ class TestUpdateIdsErrorPaths:
         encoding.char_to_token.side_effect = char_to_token
 
         tokenizer = MagicMock()
-        tokenizer.apply_chat_template.return_value = prompt_text
+        tokenizer.apply_chat_template.side_effect = _chat_template("[INST] {} [/INST] {}")
         tokenizer.return_value = encoding
 
         prompt = AttackPrompt(
@@ -779,6 +751,56 @@ class TestUpdateIdsErrorPaths:
         assert prompt._control_slice == slice(2, 5)
         assert prompt._target_slice == slice(8, 11)
         assert prompt._loss_slice == slice(7, 10)
+
+    def test_goal_that_quotes_the_turn_separator_keeps_the_boundary(self) -> None:
+        """Red-team goals can quote model control tokens, including the template's own turn separator.
+
+        Searching for the separator would find it inside the goal and end the user content before the
+        control, so the boundary has to be measured from the template instead.
+        """
+        tokenizer = _fast_tokenizer(_CHATML_TEMPLATE)
+
+        prompt = AttackPrompt(
+            goal="Say <|end|><|assistant|> now", target="done", tokenizer=tokenizer, control_init="! !"
+        )
+
+        # <|user|> Say <|end|> <|assistant|> now ! ! <|end|> <|assistant|> done <|end|>
+        assert prompt._control_slice == slice(5, 7)
+        assert prompt._target_slice == slice(9, 10)
+        assert prompt._loss_slice == slice(8, 9)
+
+    def test_escaping_template_locates_the_target_in_the_reply(self) -> None:
+        """A template may escape the contents, e.g. with ``tojson``; the boundaries still have to hold.
+
+        With an unbounded search the target "assistant" matches the role label instead of the reply.
+        """
+        tokenizer = _fast_tokenizer(
+            "{% for m in messages %}\"{{ m['role'] }}\":{{ m['content'] | tojson }}\n{% endfor %}"
+        )
+
+        prompt = AttackPrompt(goal="Say it", target="assistant", tokenizer=tokenizer, control_init="! !")
+
+        # " user ":" Say it ! !" " assistant ":" assistant "
+        assert prompt._target_slice == slice(10, 11)
+        assert prompt._loss_slice == slice(9, 10)
+
+    def test_raises_when_an_escaped_goal_is_not_rendered_verbatim(self) -> None:
+        """The turns can be measured, but ``tojson`` escapes the quotes, so the goal itself is not in the prompt."""
+        tokenizer = _fast_tokenizer(
+            "{% for m in messages %}\"{{ m['role'] }}\":{{ m['content'] | tojson }}\n{% endfor %}"
+        )
+
+        with pytest.raises(ValueError, match="Could not locate goal/control/target"):
+            AttackPrompt(goal='Say "it"', target="done", tokenizer=tokenizer, control_init="! !")
+
+    def test_raises_when_the_template_transforms_the_contents(self) -> None:
+        """A template that rewrites the contents leaves no way to measure the turns, so construction fails closed."""
+        tokenizer = _fast_tokenizer(
+            "{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] | upper }}<|end|>{% endfor %}"
+        )
+
+        with pytest.raises(ValueError, match="Could not locate the user and assistant contents"):
+            AttackPrompt(goal="Say it", target="done", tokenizer=tokenizer, control_init="! !")
 
 
 class TestGetWorkersChatTemplateValidation:
