@@ -882,6 +882,58 @@ class TestUpdateIdsErrorPaths:
         assert prompt._target_slice == slice(8, 11)
         assert prompt._loss_slice == slice(7, 10)
 
+    def test_goal_that_quotes_the_turn_separator_keeps_the_boundary(self) -> None:
+        """Red-team goals can quote model control tokens, including the template's own turn separator.
+
+        Searching for the separator would find it inside the goal and end the user content before the
+        control, so the boundary has to be measured from the template instead.
+        """
+        tokenizer = _fast_tokenizer()
+
+        prompt = AttackPrompt(
+            goal="Say <|end|><|assistant|> now", target="done", tokenizer=tokenizer, control_init="! !"
+        )
+
+        # <|user|> Say <|end|> <|assistant|> now ! ! <|end|> <|assistant|> done <|end|>
+        assert prompt._control_slice == slice(5, 7)
+        assert prompt._target_slice == slice(9, 10)
+        assert prompt._loss_slice == slice(8, 9)
+
+    def test_escaping_template_locates_the_target_in_the_reply(self) -> None:
+        """A template may escape the contents, e.g. with ``tojson``; the boundaries still have to hold.
+
+        With an unbounded search the target "assistant" matches the role label instead of the reply.
+        """
+        tokenizer = _fast_tokenizer(
+            chat_template="{% for m in messages %}\"{{ m['role'] }}\":{{ m['content'] | tojson }}\n{% endfor %}",
+            byte_level=True,
+        )
+
+        prompt = AttackPrompt(goal="Say it", target="assistant", tokenizer=tokenizer, control_init="! !")
+
+        target_start = len('"user":"Say it ! !"\n"assistant":"')
+        assert prompt._target_slice == slice(target_start, target_start + len("assistant"))
+        assert prompt._loss_slice == slice(target_start - 1, target_start + len("assistant") - 1)
+        assert prompt.target_str == "assistant"
+
+    def test_raises_when_an_escaped_goal_is_not_rendered_verbatim(self) -> None:
+        """The turns can be measured, but ``tojson`` escapes the quotes, so the goal itself is not in the prompt."""
+        tokenizer = _fast_tokenizer(
+            chat_template="{% for m in messages %}\"{{ m['role'] }}\":{{ m['content'] | tojson }}\n{% endfor %}"
+        )
+
+        with pytest.raises(ValueError, match="Cannot safely locate"):
+            AttackPrompt(goal='Say "it"', target="done", tokenizer=tokenizer, control_init="! !")
+
+    def test_raises_when_the_template_transforms_the_contents(self) -> None:
+        """A template that rewrites the contents leaves no way to measure the turns, so construction fails closed."""
+        tokenizer = _fast_tokenizer(
+            chat_template="{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] | upper }}<|end|>{% endfor %}"
+        )
+
+        with pytest.raises(ValueError, match="Cannot safely locate"):
+            AttackPrompt(goal="Say it", target="done", tokenizer=tokenizer, control_init="! !")
+
 
 @pytest.mark.usefixtures("patch_central_database")
 class TestPromptSliceWiring:
