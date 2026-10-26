@@ -23,7 +23,7 @@ class CandidateProposalBatch:
 
     Attributes:
         control_candidates_by_group: List of filtered candidate string lists, one per
-            compatible gradient group (same shape and vocabulary).
+            compatible gradient group (same shape and vocabulary within the embedding rows).
         group_worker_indices: Index of the last worker in each contiguous compatible
             gradient group, used for sampling and filtering that group.
     """
@@ -78,16 +78,6 @@ class GCGCandidateProposer:
         self._sample_fn = sample_fn
         self._filter_fn = filter_fn
         self._main_device = main_device
-        # Gradients are summed per token id, so equal shapes are not enough: two tokenizers with the
-        # same vocabulary size (e.g. Llama-2 and Mistral) map most ids to different tokens. Added tokens
-        # are ignored since candidates containing them never survive filtering.
-        base_vocabs = [
-            {token: i for token, i in worker.tokenizer.get_vocab().items() if i < worker.tokenizer.vocab_size}
-            for worker in workers
-        ]
-        self._shares_vocab_with_previous = [True] + [
-            previous == current for previous, current in zip(base_vocabs, base_vocabs[1:], strict=False)
-        ]
 
     def propose_candidates(
         self,
@@ -124,16 +114,21 @@ class GCGCandidateProposer:
         control_cands: list[list[str]] = []
         group_worker_indices: list[int] = []
         grad: torch.Tensor | None = None
+        vocab: dict[str, int] | None = None
 
         # Collect and aggregate gradients across workers
         for j, worker in enumerate(self._workers):
             new_grad: torch.Tensor = worker.results.get().to(self._main_device)
             new_grad = new_grad / new_grad.norm(dim=-1, keepdim=True)
+            # Each embedding row is a sampleable token ID, including added tokens.
+            # Tokens outside the embedding matrix cannot be sampled and need not match.
+            new_vocab = {token: i for token, i in worker.tokenizer.get_vocab().items() if i < new_grad.shape[-1]}
 
             if grad is None:
                 grad = torch.zeros_like(new_grad)
+                vocab = new_vocab
 
-            if grad.shape != new_grad.shape or not self._shares_vocab_with_previous[j]:
+            if grad.shape != new_grad.shape or vocab != new_vocab:
                 # Shape or vocabulary mismatch: finalize the preceding group
                 with torch.no_grad():
                     sampled = self._sample_group(
@@ -153,6 +148,7 @@ class GCGCandidateProposer:
                     control_cands.append(filtered)
                     group_worker_indices.append(j - 1)
                 grad = new_grad
+                vocab = new_vocab
             else:
                 grad += new_grad
 
